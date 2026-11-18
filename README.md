@@ -8,18 +8,19 @@ bấm **Dự đoán**, hệ thống chạy lần lượt 5 bước bằng đúng
 ```
 
 Dữ liệu đầu vào: **chọn 1 trong 171 bệnh nhân tập Test** (lọc theo nhóm, tìm theo ID, chọn ngẫu nhiên; form tự điền giá trị gốc)
-hoặc **nhập tay** 12 ô. Mỗi bước hiển thị dữ liệu trung gian thật (z-score, đầu ra từng seed GRU, đặc trưng và khoảng cách tới tâm cụm) và thời gian chạy.
+hoặc **nhập tay** 12 ô. Kết quả gồm nhóm tiến triển, eGFR dự đoán tháng 18–36 kèm giai đoạn, biểu đồ và cảnh báo.
 Chỉ phục vụ nghiên cứu/minh hoạ; **không** chẩn đoán, không thay thế đánh giá của nhân viên y tế.
 
 ```
 ckd-hm/
-├─ backend/                 FastAPI + PyTorch (CPU) + scikit-learn
-│  ├─ app/ml/network.py     kiến trúc Seq2Seq GRU (sao chép nguyên văn GRU.ipynb, ô 4)
+├─ backend/                 FastAPI + ONNX Runtime + NumPy (không cần PyTorch khi chạy)
 │  ├─ app/ml/predictor.py   nạp mô hình + chạy 5 bước (run_pipeline)
 │  ├─ app/routers/predict.py  GET /api/health · GET /api/test-patients · POST /api/predict
 │  ├─ app/data/test_patients.json  171 bệnh nhân tập Test (giá trị gốc CKD-ROUTE + kết quả notebook + eGFR thật)
-│  ├─ ml_assets/            gru_lstm_phat_nang.pt · phan_cum.joblib · tham_so_tien_xu_ly.json
-│  ├─ scripts/              verify_model.py (kiểm chứng với notebook) · build_test_patients.py
+│  ├─ ml_assets/            dùng khi chạy: gru.onnx · gru.json · phan_cum.json · tham_so_tien_xu_ly.json
+│  │                        bản gốc từ notebook: gru_lstm_phat_nang.pt · phan_cum.joblib
+│  ├─ scripts/              export_runtime_assets.py (gốc -> ONNX/JSON, tự kiểm tra) · network.py (kiến trúc GRU gốc)
+│  │                        verify_model.py (kiểm chứng với notebook) · build_test_patients.py
 │  └─ tests/                pytest (10 test, gồm kiểm tra 171 BN tập Test khớp notebook)
 ├─ frontend/                React + TypeScript + Vite + Tailwind + Recharts (1 trang)
 ├─ Demo_HM/                 (KHÔNG commit) notebook huấn luyện GRU.ipynb, train/val/test.xlsx, CSV kết quả
@@ -33,6 +34,9 @@ ckd-hm/
 - **K-Means** (K = 3): 5 đặc trưng = độ dốc eGFR, thay đổi tổng tới tháng 36, UPCR_z, Alb_z, SBP_z → cắt phân vị 5–95% của Train → StandardScaler → nhóm *Chuyển biến xấu / Ổn định / Cải thiện*.
 - 13 biến tĩnh: tuổi, giới (mã 1/2), tăng huyết áp, đái tháo đường, bệnh tim mạch, nguyên nhân CKD (mã 1–4, one-hot), UPCR (log1p, z-score; thiếu → giá trị điền của Train + cờ `UPCR_thieu`), albumin, huyết áp tâm thu.
   Tham số chuẩn hoá lấy từ tập Train (`tham_so_tien_xu_ly.json`).
+- **Cách chạy mô hình**: GRU (5 seed) được xuất sang `gru.onnx` và chạy bằng ONNX Runtime; K-Means, StandardScaler và giới hạn cắt
+  được xuất sang `phan_cum.json` và tính bằng NumPy. `scripts/export_runtime_assets.py` sinh các tệp này từ bản gốc của notebook
+  và tự kiểm tra: ONNX lệch < 10⁻⁵ eGFR so với PyTorch, K-Means trùng cụm 100% với scikit-learn. Nhờ vậy backend chỉ cần ~100 MB RAM.
 - **Đã kiểm chứng**: `scripts/verify_model.py` chạy lại mô hình trên train/val/test và so với CSV của notebook: MAE khớp, sai khác dự đoán < 2·10⁻⁵, nhóm trùng 100%.
   Test `test_all_test_patients_reproduce_notebook` chạy cả 171 bệnh nhân tập Test qua API: eGFR và nhóm đều khớp notebook.
 
@@ -55,7 +59,7 @@ Yêu cầu: Python 3.12, Node 20+.
 # Backend (cửa sổ 1)
 cd backend
 python -m venv .venv && .venv/Scripts/activate        # Linux/mac: source .venv/bin/activate
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt                    # chỉ để chạy web: pip install -r requirements.txt
 uvicorn app.main:app --port 8000                       # Swagger: http://localhost:8000/api/docs
 pytest -q
 
@@ -79,10 +83,15 @@ POST /api/predict
 Dữ liệu sai kiểu/ngoài khoảng → `422 {"error":"validation_error","details":[{"field","label","message"}]}`.
 Mô hình chưa nạp được → `503 model_not_ready` (không bao giờ trả kết quả giả).
 
-## 4. Triển khai
-- **Backend (Render)**: tạo từ `render.yaml` (Docker, root `backend`). Biến môi trường: `ENVIRONMENT=production`, `CORS_ORIGINS=https://<app>.vercel.app`. PyTorch CPU cần vài trăm MB RAM.
-- **Frontend (Vercel)**: Root Directory `frontend`, Build `npm run build`, Output `dist`, biến `VITE_API_URL=https://<api>.onrender.com`.
+## 4. Triển khai (miễn phí)
+- **Backend (Render, gói Free)**: New → Blueprint → chọn repo GitHub này (đọc `render.yaml`: Docker, root `backend`, vùng Singapore).
+  Biến môi trường: `CORS_ORIGINS=https://<tên>.pages.dev`. Gói Free ngủ sau 15 phút không dùng; lần mở sau chờ khoảng 1 phút.
+- **Frontend (Cloudflare Pages)**: Workers & Pages → Create → Pages → Connect to Git → chọn repo.
+  Root directory `frontend`, Build command `npm run build`, Output `dist`, biến `VITE_API_URL=https://<api>.onrender.com`
+  (không có `/` ở cuối). Node 22 (tệp `frontend/.node-version`).
 - Kiểm tra: `GET <api>/api/health` → `{"status":"ok","model_ready":true}`.
+- Đổi mô hình: chạy lại notebook → chép `gru_lstm_phat_nang.pt`, `phan_cum.joblib`, `tham_so_tien_xu_ly.json` vào `ml_assets/`
+  → `python scripts/export_runtime_assets.py` → `pytest -q`.
 
 ## 5. Hạn chế
 - Không có khoảng tin cậy; “dao động giữa 5 seed” chỉ thể hiện mức đồng thuận giữa các mô hình con.

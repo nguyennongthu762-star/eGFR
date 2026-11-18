@@ -107,7 +107,7 @@ export default function App() {
 
 function ModelStatus({ health, error }: { health: Health | null; error: string | null }) {
   if (error) return <span className="inline-flex items-center gap-1.5 rounded-full border border-red-300 bg-red-50 px-3 py-1 text-xs font-medium text-red-800"><ServerCrash className="h-3.5 w-3.5" aria-hidden /> Chưa kết nối được backend · đang thử lại…</span>
-  if (!health) return <span className="text-xs text-slate-500">Đang kiểm tra mô hình…</span>
+  if (!health) return <span className="text-xs text-slate-500">Đang kết nối máy chủ… (lần đầu có thể mất khoảng 1 phút)</span>
   if (!health.model_ready) return <span title={health.model_error ?? ''} className="inline-flex items-center gap-1.5 rounded-full border border-red-300 bg-red-50 px-3 py-1 text-xs font-medium text-red-800"><AlertTriangle className="h-3.5 w-3.5" aria-hidden /> Chưa nạp được mô hình</span>
   return null
 }

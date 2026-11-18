@@ -3,3 +3,6 @@ __pycache__
 *.db
 .env
 tests
+scripts
+ml_assets/*.pt
+ml_assets/*.joblib

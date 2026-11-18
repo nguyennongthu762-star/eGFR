@@ -1,12 +1,15 @@
-# Blueprint Render: chỉ một dịch vụ API (Docker), không cần cơ sở dữ liệu. Frontend triển khai riêng trên Vercel.
+# Blueprint Render: một dịch vụ API (Docker, gói Free), không cần cơ sở dữ liệu.
+# Mô hình chạy bằng ONNX Runtime (~100 MB RAM), vừa gói Free 512 MB. Frontend triển khai riêng trên Cloudflare Pages.
 services:
   - type: web
     name: ckd-api
     runtime: docker
+    plan: free
+    region: singapore
     rootDir: backend
     healthCheckPath: /api/health
     envVars:
       - key: ENVIRONMENT
         value: production
       - key: CORS_ORIGINS
-        sync: false   # đặt = URL frontend trên Vercel, vd https://ckd-app.vercel.app
+        sync: false   # đặt = URL frontend trên Cloudflare Pages, vd https://egfr.pages.dev

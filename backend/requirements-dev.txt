@@ -1,5 +1,11 @@
+# Thư viện cho máy phát triển: chạy test và xuất lại mô hình (scripts/export_runtime_assets.py).
 -r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
 pytest
 httpx
+pandas==3.1.0
 openpyxl==3.1.5
-scipy==1.18.1
+torch==2.14.1
+scikit-learn==1.6.1
+joblib==1.6.0
+onnx==1.23.2

@@ -2,6 +2,10 @@
 
 Toàn bộ logic tính toán bám sát GRU.ipynb (ô 6, 8, 9). Không huấn luyện lại, không tạo kết quả giả:
 nếu thiếu tệp mô hình thì `Predictor.ready` là False và `run_pipeline` ném ModelNotReady.
+
+Chạy bằng ONNX Runtime + NumPy (không cần PyTorch/scikit-learn) để vừa máy chủ nhỏ. Các tệp gru.onnx,
+gru.json, phan_cum.json được xuất từ mô hình gốc bằng scripts/export_runtime_assets.py, script này kiểm tra
+kết quả trùng với PyTorch/scikit-learn trước khi ghi.
 """
 from __future__ import annotations
 
@@ -9,16 +13,11 @@ import json
 import logging
 import math
 import time
-import warnings
 from pathlib import Path
 from typing import Any
 
-import joblib
 import numpy as np
-import pandas as pd
-import torch
-
-from .network import Seq2SeqNangCao, TapHop, dac_trung_chuoi
+import onnxruntime as ort
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +25,7 @@ MONTHS_HISTORY = [0, 6, 12]
 MONTHS_PREDICT = [18, 24, 30, 36]
 THOI_GIAN = np.array([0, 0.5, 1, 1.5, 2, 2.5, 3])  # năm, ứng với 0M..36M
 CONFIDENCE = {1: "Thấp", 2: "Trung bình", 3: "Cao"}
-REQUIRED_FILES = ("gru_lstm_phat_nang.pt", "phan_cum.joblib", "tham_so_tien_xu_ly.json")
+REQUIRED_FILES = ("gru.onnx", "gru.json", "phan_cum.json", "tham_so_tien_xu_ly.json")
 
 # Mã gốc của CKD-ROUTE, đối chiếu với Bảng 2 của Iimori et al. 2018 (PLoS ONE): tỉ lệ nam 70,2%;
 # nguyên nhân 7,7% / 59,7% / 6,8% / 25,9% ở nhóm đạm niệu bình thường (n = 352) khớp đúng với mã 1/2/3/4.
@@ -82,15 +81,22 @@ def slope_per_year(y: np.ndarray) -> float:
     return float(((t - t.mean()) * (y[ok] - y[ok].mean())).sum() / ((t - t.mean()) ** 2).sum())
 
 
+def last_observed(Vh: np.ndarray) -> np.ndarray:
+    """eGFR (z) của lần đo thật gần nhất trong 0/6/12M; Vh (N,3) có NaN, cột 0 luôn có."""
+    out = Vh[:, 0].copy()
+    for t in (1, 2):
+        out = np.where(np.isnan(Vh[:, t]), out, Vh[:, t])
+    return out
+
+
 def _r(v: float, d: int = 3) -> float | None:
     v = float(v)
     return None if math.isnan(v) else round(v, d)
 
 
 class Predictor:
-    def __init__(self, asset_dir: str | Path, device: str = "cpu"):
+    def __init__(self, asset_dir: str | Path):
         self.asset_dir = Path(asset_dir)
-        self.device = device
         self.ready = False
         self.error: str | None = None
         self.version_info: dict[str, Any] = {}
@@ -109,31 +115,29 @@ class Predictor:
 
         self.params = json.loads((self.asset_dir / "tham_so_tien_xu_ly.json").read_text(encoding="utf-8"))
         self.static_cols: list[str] = self.params["cot_dau_vao_tinh"]
-        ck = torch.load(self.asset_dir / "gru_lstm_phat_nang.pt", map_location=self.device, weights_only=False)
-        cfg = ck["GRU"]["cau_hinh"]
-        models = []
-        for sd in ck["GRU"]["state_dicts"]:
-            m = Seq2SeqNangCao("GRU", hidden=cfg["hidden"], layers=cfg["layers"], dropout=cfg["dropout"])
-            m.load_state_dict(sd)
-            models.append(m)
-        self.gru = TapHop(models).to(self.device).eval()
-        self.mu, self.sd = float(ck["mu"]), float(ck["sd"])
+        g = json.loads((self.asset_dir / "gru.json").read_text(encoding="utf-8"))
+        cfg = g["cau_hinh"]
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        self.gru = ort.InferenceSession(str(self.asset_dir / "gru.onnx"), opts, providers=["CPUExecutionProvider"])
+        self.n_seeds = int(g["n_seeds"])
+        self.mu, self.sd = float(g["mu"]), float(g["sd"])
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            pc = joblib.load(self.asset_dir / "phan_cum.joblib")
+        pc = json.loads((self.asset_dir / "phan_cum.json").read_text(encoding="utf-8"))
         if pc["MO_HINH_CHON"] != "KMeans":
             raise ModelNotReady(f"Mô hình phân cụm được chọn là {pc['MO_HINH_CHON']}, dịch vụ này chỉ hỗ trợ KMeans.")
-        self.pc = pc
         self.cluster_cols: list[str] = pc["COT_VAO"]
-        self.kmeans = pc["kmeans"]
-        self.cluster_names: dict[int, str] = pc["ten_km"]
+        self.clip_lo, self.clip_hi = np.array(pc["can_duoi"]), np.array(pc["can_tren"])
+        self.scaler_mean, self.scaler_scale = np.array(pc["scaler_mean"]), np.array(pc["scaler_scale"])
+        self.centers = np.array(pc["tam_cum"])
+        self.cluster_names: dict[int, str] = {int(k): v for k, v in pc["ten_km"].items()}
         self.bad_cluster = next(c for c, n in self.cluster_names.items() if n == "Chuyển biến xấu")
         self.fast_decline_threshold = float(pc["NGUONG_NHANH"])
         self.version_info = {
             "gru_config": cfg,
-            "n_gru_seeds": len(models),
-            "n_params_per_seed": sum(p.numel() for p in models[0].parameters()),
+            "n_gru_seeds": self.n_seeds,
+            "n_params_per_seed": int(g["n_params_per_seed"]),
+            "runtime": "onnxruntime",
             "cluster_model": pc["MO_HINH_CHON"],
             "n_clusters": int(pc["K"]),
             "cluster_features": self.cluster_cols,
@@ -193,34 +197,28 @@ class Predictor:
 
     def _gru_per_seed(self, Vh: np.ndarray, S: np.ndarray) -> np.ndarray:
         """Dự đoán của từng seed GRU, đơn vị eGFR thật: (n_seed, N, 4). Trung bình theo seed = TapHop."""
-        vh = torch.tensor(Vh, dtype=torch.float32, device=self.device)
-        s = torch.tensor(S, dtype=torch.float32, device=self.device)
-        ln = torch.full((len(vh),), 3, dtype=torch.long, device=self.device)
-        with torch.no_grad():
-            out = torch.stack([m(vh, ln, s) for m in self.gru.models])[:, :, :4].cpu().numpy()
-        return out * self.sd + self.mu
+        out = self.gru.run(None, {"Vh": np.asarray(Vh, dtype=np.float32), "S": np.asarray(S, dtype=np.float32)})[0]
+        return out.astype(np.float64) * self.sd + self.mu
 
     def _cluster(self, Vh: np.ndarray, S: np.ndarray, du: np.ndarray) -> dict[str, np.ndarray]:
         """Từ eGFR đo (Vh) + eGFR GRU dự đoán (du) -> đặc trưng xu hướng -> K-Means."""
-        vh = torch.tensor(Vh, dtype=torch.float32)
-        ln = torch.full((len(vh),), 3, dtype=torch.long)
-        _, last, _ = dac_trung_chuoi(vh, ln)
-        last = last.numpy() * self.sd + self.mu
-        ls = vh.numpy() * self.sd + self.mu
+        Vh = np.asarray(Vh, dtype=np.float32)
+        last = last_observed(Vh).astype(np.float64) * self.sd + self.mu
+        ls = Vh.astype(np.float64) * self.sd + self.mu
         Y = np.concatenate([ls, du], axis=1)
         slope = np.array([slope_per_year(r) for r in Y])
         total = du[:, 3] - last
         # cột 2-4 của đầu vào phân cụm: log1p_UPCR_z, Alb_z, SBP_z
         col = {c: self.static_cols.index(c) for c in ("log1p_UPCR_z", "Alb_z", "SBP_z")}
         feats = {"do_doc": slope, "thay_doi_tong": total, **{c: S[:, i] for c, i in col.items()}}
-        raw_feats = pd.DataFrame({c: feats[c] for c in self.cluster_cols})
-        df = raw_feats.clip(lower=self.pc["can_duoi"], upper=self.pc["can_tren"], axis=1)
-        X = self.pc["scaler"].transform(df.values)
-        labels = self.kmeans.predict(X)
-        dist = self.kmeans.transform(X)
+        raw_feats = np.stack([np.asarray(feats[c], dtype=np.float64) for c in self.cluster_cols], 1)
+        clipped = np.clip(raw_feats, self.clip_lo, self.clip_hi)             # cắt về phân vị 5–95% của Train
+        X = (clipped - self.scaler_mean) / self.scaler_scale                 # StandardScaler (fit trên Train)
+        dist = np.sqrt(((X[:, None, :] - self.centers[None]) ** 2).sum(-1))  # khoảng cách Euclid tới tâm cụm
+        labels = dist.argmin(1)                                               # = KMeans.predict
         risk = -dist[:, self.bad_cluster]
         return {"du_doan": du, "lich_su": ls, "last": last, "do_doc": slope, "thay_doi_tong": total,
-                "cluster_id": labels, "risk": risk, "features_raw": raw_feats.values, "features": df.values,
+                "cluster_id": labels, "risk": risk, "features_raw": raw_feats, "features": clipped,
                 "features_scaled": X, "distances": dist}
 
     # ------------------------------------------------- chạy đủ 5 bước cho 1 bệnh nhân
@@ -297,15 +295,14 @@ class Predictor:
         per_seed = self._gru_per_seed(Vh[None, :], S[None, :])[:, 0, :]   # (n_seed, 4)
         du = per_seed.mean(0)
         ls = Vh * self.sd + self.mu
-        _, last_z, _ = dac_trung_chuoi(torch.tensor(Vh[None, :]), torch.full((1,), 3, dtype=torch.long))
-        last = float(last_z[0]) * self.sd + self.mu
+        last = float(last_observed(Vh[None, :])[0]) * self.sd + self.mu
         done("gru", "GRU dự đoán eGFR", {
             "predicted": [{"month": m, "egfr": _r(du[i]), "stage": ckd_stage(float(du[i])),
                            "seed_min": _r(per_seed[:, i].min()), "seed_max": _r(per_seed[:, i].max())}
                           for i, m in enumerate(MONTHS_PREDICT)],
             "history": [{"month": m, "egfr": _r(ls[i])} for i, m in enumerate(MONTHS_HISTORY)],
             "last_observed": _r(last),
-            "n_seeds": len(self.gru.models),
+            "n_seeds": self.n_seeds,
             "config": self.version_info["gru_config"],
         }, t)
 

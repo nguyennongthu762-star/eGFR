@@ -9,3 +9,6 @@ node_modules/
 dist/
 .pytest_cache/
 .vercel/
+
+# Thư mục huấn luyện (dữ liệu bệnh nhân, notebook) – không đưa vào repo
+Demo_HM/

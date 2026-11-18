@@ -4,5 +4,5 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY . .
-# Chạy migration rồi khởi động API. $PORT do nền tảng (Render/Railway...) cấp.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# $PORT do nền tảng (Render/Railway...) cấp.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

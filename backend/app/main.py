@@ -7,41 +7,32 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import get_settings
-from .db import Base, SessionLocal, engine
 from .ml.predictor import Predictor
-from .registry import sync_model_versions
-from .routers import admin, auth, misc, patients
+from .routers import predict
 
 settings = get_settings()
 logging.basicConfig(level=logging.INFO)
 
+FIELD_LABELS = {
+    "egfr_0m": "eGFR tháng 0", "egfr_6m": "eGFR tháng 6", "egfr_12m": "eGFR tháng 12", "age": "Tuổi",
+    "gender": "Giới tính", "etiology": "Nguyên nhân CKD", "hypertension": "Tăng huyết áp",
+    "diabetes": "Đái tháo đường", "cvd": "Bệnh tim mạch", "sbp": "Huyết áp tâm thu", "albumin": "Albumin",
+    "upcr": "UPCR",
+}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if settings.sqlalchemy_url.startswith("sqlite"):
-        Base.metadata.create_all(engine)  # chỉ cho dev/test; PostgreSQL dùng `alembic upgrade head`
-    app.state.predictor = Predictor(settings.model_asset_dir)
-    with SessionLocal() as db:
-        sync_model_versions(db, app.state.predictor)
+    app.state.predictor = Predictor(settings.model_asset_dir)  # nạp mô hình một lần khi khởi động
     yield
 
 
-app = FastAPI(title="CKD eGFR Progression API", version="1.0.0", lifespan=lifespan,
+app = FastAPI(title="CKD eGFR – GRU + K-Means", version="2.0.0", lifespan=lifespan,
               docs_url="/api/docs" if settings.environment != "production" else None,
               redoc_url=None, openapi_url="/api/openapi.json" if settings.environment != "production" else None)
 
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_list, allow_credentials=False,
-                   allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type"])
-
-
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    resp = await call_next(request)
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+                   allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
 
 
 # Định dạng lỗi thống nhất: {"error": <mã>, "message": <thông điệp>, "details"?: [...]}
@@ -53,10 +44,12 @@ async def http_exc(_: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exc(_: Request, exc: RequestValidationError):
-    details = [{"field": ".".join(str(p) for p in e["loc"][1:]), "message": e["msg"]} for e in exc.errors()]
+    details = []
+    for e in exc.errors():
+        field = ".".join(str(p) for p in e["loc"][1:])
+        details.append({"field": field, "label": FIELD_LABELS.get(field, field), "message": e["msg"]})
     return JSONResponse({"error": "validation_error", "message": "Dữ liệu không hợp lệ", "details": details},
                         status_code=422)
 
 
-for r in (auth.router, patients.router, admin.router, misc.router):
-    app.include_router(r)
+app.include_router(predict.router)
